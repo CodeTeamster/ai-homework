@@ -7,64 +7,75 @@
 import math
 import numpy as np
 import os
-import cv2
 import random
-import shutil
-import time
-from matplotlib import pyplot as plt
-from easydict import EasyDict
-from PIL import Image
-
 import mindspore as ms
+
+
+from easydict import EasyDict
 from mindspore import context
 from mindspore import nn
 from mindspore import Tensor
 from mindspore.train.model import Model
-from mindspore.train.serialization import load_checkpoint, save_checkpoint, export
-from mindspore.train.callback import Callback, LossMonitor, ModelCheckpoint, CheckpointConfig
+from mindspore.train.serialization import load_checkpoint, save_checkpoint
+from src_mindspore.dataset import create_dataset
+from src_mindspore.mobilenetv2 import MobileNetV2Backbone, MobileNetV2Head, mobilenet_v2
 
-from src_mindspore.dataset import create_dataset # 数据处理脚本
-from src_mindspore.mobilenetv2 import MobileNetV2Backbone, MobileNetV2Head, mobilenet_v2 # 模型定义脚本
 
 os.environ['GLOG_v'] = '2' # Log Level = Error
 has_gpu = (os.system('command -v nvidia-smi') == 0)
-print('Excuting with', 'GPU' if has_gpu else 'CPU', '.')
-context.set_context(mode=context.GRAPH_MODE, device_target='GPU' if has_gpu else 'CPU')
-
+context.set_context(mode=context.GRAPH_MODE, device_target='CPU')
 # 垃圾分类数据集标签，以及用于标签映射的字典。
-index = {'00_00': 0, '00_01': 1, '00_02': 2, '00_03': 3, '00_04': 4, '00_05': 5, '00_06': 6, '00_07': 7,
-         '00_08': 8, '00_09': 9, '01_00': 10, '01_01': 11, '01_02': 12, '01_03': 13, '01_04': 14,
-         '01_05': 15, '01_06': 16, '01_07': 17, '02_00': 18, '02_01': 19, '02_02': 20, '02_03': 21,
-         '03_00': 22, '03_01': 23, '03_02': 24, '03_03': 25}
-inverted = {0: 'Plastic Bottle', 1: 'Hats', 2: 'Newspaper', 3: 'Cans', 4: 'Glassware', 5: 'Glass Bottle', 6: 'Cardboard', 7: 'Basketball',
-            8: 'Paper', 9: 'Metalware', 10: 'Disposable Chopsticks', 11: 'Lighter', 12: 'Broom', 13: 'Old Mirror', 14: 'Toothbrush',
-            15: 'Dirty Cloth', 16: 'Seashell', 17: 'Ceramic Bowl', 18: 'Paint bucket', 19: 'Battery', 20: 'Fluorescent lamp', 21: 'Tablet capsules',
-            22: 'Orange Peel', 23: 'Vegetable Leaf', 24: 'Eggshell', 25: 'Banana Peel'}
+index = {
+    '00_00': 0, '00_01': 1, '00_02': 2, '00_03': 3, '00_04': 4,
+    '00_05': 5, '00_06': 6, '00_07': 7, '00_08': 8, '00_09': 9,
+    '01_00': 10, '01_01': 11, '01_02': 12, '01_03': 13, '01_04': 14,
+    '01_05': 15, '01_06': 16, '01_07': 17, '02_00': 18, '02_01': 19,
+    '02_02': 20, '02_03': 21, '03_00': 22, '03_01': 23, '03_02': 24,
+    '03_03': 25
+}
+inverted = {
+    0: 'Plastic Bottle', 1: 'Hats', 2: 'Newspaper', 3: 'Cans', 4: 'Glassware',
+    5: 'Glass Bottle', 6: 'Cardboard', 7: 'Basketball', 8: 'Paper', 9: 'Metalware',
+    10: 'Disposable Chopsticks', 11: 'Lighter', 12: 'Broom', 13: 'Old Mirror', 14: 'Toothbrush',
+    15: 'Dirty Cloth', 16: 'Seashell', 17: 'Ceramic Bowl', 18: 'Paint bucket', 19: 'Battery',
+    20: 'Fluorescent lamp', 21: 'Tablet capsules', 22: 'Orange Peel', 23: 'Vegetable Leaf', 24: 'Eggshell',
+    25: 'Banana Peel'
+}
+
 
 # 训练超参
 config = EasyDict({
-    "num_classes": 26, # 分类数，即输出层的维度
-    "reduction": 'mean', # mean, max, Head部分池化采用的方式
+    "num_classes": 26,
+    "reduction": 'mean',
     "image_height": 224,
     "image_width": 224,
-    "batch_size": 24, # 鉴于CPU容器性能，太大可能会导致训练卡住
+    "batch_size": 32,
     "eval_batch_size": 10,
-    "epochs": 10, # 请尝试修改以提升精度
-    "lr_max": 0.01, # 请尝试修改以提升精度
-    "decay_type": 'constant', # 请尝试修改以提升精度
-    "momentum": 0.8, # 请尝试修改以提升精度
-    "weight_decay": 3.0, # 请尝试修改以提升精度
+    "dropout_rate": 0.5,
+    "epochs": 100,
+    "lr_max": 0.01,
+    "warmup_steps": 0,
+    "decay_type": 'cosine',
+    "momentum": 0.9,
+    "weight_decay": 1e-4,
     "dataset_path": "./datasets/5fbdf571c06d3433df85ac65-momodel/garbage_26x100",
-    "features_path": "./results/garbage_26x100_features", # 临时目录，保存冻结层Feature Map，可随时删除
+    "features_path": "./results/garbage_26x100_features",
     "class_index": index,
     "save_ckpt_epochs": 1,
     "save_ckpt_path": './results/ckpt_mobilenetv2',
     "pretrained_ckpt": './src_mindspore/mobilenetv2-200_1067_cpu_gpu.ckpt',
     "export_path": './results/mobilenetv2.mindir'
-
 })
 
-def build_lr(total_steps, lr_init=0.0, lr_end=0.0, lr_max=0.1, warmup_steps=0, decay_type='cosine'):
+
+def build_lr(
+    total_steps,
+    lr_init=0.0,
+    lr_end=0.0,
+    lr_max=0.1,
+    warmup_steps=0,
+    decay_type='cosine'
+):
     """
     Applies cosine decay to generate learning rate array.
 
@@ -121,12 +132,12 @@ def extract_features(net, dataset_path, config):
         print(f"Complete the batch {i+1}/{step_size}")
     return
 
+
 backbone = MobileNetV2Backbone()
 load_checkpoint(config.pretrained_ckpt, net=backbone)
 extract_features(backbone, config.dataset_path, config)
-# backbone = MobileNetV2Backbone()
-# load_checkpoint(config.pretrained_ckpt, net=backbone)
-# extract_features(backbone, config.dataset_path, config)
+
+
 class GlobalPooling(nn.Cell):
     """
     Global avg pooling definition.
@@ -170,15 +181,30 @@ class MobileNetV2Head(nn.Cell):
         >>> MobileNetV2Head(num_classes=1000)
     """
 
-    def __init__(self, input_channel=1280, hw=7, num_classes=1000, reduction='mean', activation="None"):
-        self.need_activation = True
+    def __init__(
+        self,
+        input_channel=1280,
+        hw=7,
+        num_classes=1000,
+        reduction='mean',
+        activation="None",
+        dropout_rate=0.0,
+    ):
         super(MobileNetV2Head, self).__init__()
+        self.need_activation = True
+        self.dropout_rate = dropout_rate
+        if self.dropout_rate > 0.0:
+            self.dropout = nn.Dropout(p=dropout_rate)
+
         if reduction:
             self.flatten = GlobalPooling(reduction)
         else:
             self.flatten = nn.Flatten()
             input_channel = input_channel * hw * hw
-        self.dense = nn.Dense(input_channel, num_classes, weight_init='ones', has_bias=False)
+
+        self.fc1 = nn.Dense(input_channel, 512, weight_init='xavier_uniform')
+        self.fc2 = nn.Dense(512, num_classes, weight_init='xavier_uniform')
+
         if activation == "Sigmoid":
             self.activation = nn.Sigmoid()
         elif activation == "Softmax":
@@ -188,10 +214,14 @@ class MobileNetV2Head(nn.Cell):
 
     def construct(self, x):
         x = self.flatten(x)
-        x = self.dense(x)
+        if self.dropout_rate > 0.0:
+            x = self.dropout(x)
+        x = self.fc1(x)
+        x = self.fc2(x)
         if self.need_activation:
             x = self.activation(x)
         return x
+
 
 def train_head():
     train_dataset = create_dataset(config=config)
@@ -204,11 +234,21 @@ def train_head():
        param.requires_grad = False
     load_checkpoint(config.pretrained_ckpt, net=backbone)
 
-    head = MobileNetV2Head(input_channel=backbone.out_channels, num_classes=config.num_classes, reduction=config.reduction)
+    head = MobileNetV2Head(
+        input_channel=backbone.out_channels,
+        num_classes=config.num_classes,
+        reduction=config.reduction,
+        dropout_rate=config.dropout_rate,
+    )
     network = mobilenet_v2(backbone, head)
 
     loss = nn.SoftmaxCrossEntropyWithLogits(sparse=True, reduction='mean')
-    lrs = build_lr(config.epochs * step_size, lr_max=config.lr_max, warmup_steps=0, decay_type=config.decay_type)
+    lrs = build_lr(
+        config.epochs * step_size,
+        lr_max=config.lr_max,
+        warmup_steps=config.warmup_steps,
+        decay_type=config.decay_type
+    )
     opt = nn.Momentum(head.trainable_params(), lrs, config.momentum, config.weight_decay)
     net = nn.WithLossCell(head, loss)
     train_step = nn.TrainOneStepCell(net, opt)
@@ -216,38 +256,36 @@ def train_head():
 
     # train
     history = list()
+    best_acc = 0.0
     features_path = config.features_path
     idx_list = list(range(step_size))
     for epoch in range(config.epochs):
         random.shuffle(idx_list)
-        epoch_start = time.time()
         losses = []
         for j in idx_list:
             feature = Tensor(np.load(os.path.join(features_path, f"feature_{j}.npy")))
             label = Tensor(np.load(os.path.join(features_path, f"label_{j}.npy")))
             losses.append(train_step(feature, label).asnumpy())
-        epoch_seconds = (time.time() - epoch_start)
         epoch_loss = np.mean(np.array(losses))
 
         history.append(epoch_loss)
-        print("epoch: {}, time cost: {}, avg loss: {}".format(epoch + 1, epoch_seconds, epoch_loss))
-        if (epoch + 1) % config.save_ckpt_epochs == 0:
-            save_checkpoint(network, os.path.join(config.save_ckpt_path, f"mobilenetv2-{epoch+1}.ckpt"))
-
-    # evaluate
-    print('validating the model...')
-    eval_model = Model(network, loss, metrics={'acc', 'loss'})
-    acc = eval_model.eval(eval_dataset, dataset_sink_mode=False)
-    print(acc)
+        acc = Model(
+            network,
+            loss,
+            metrics={'acc', 'loss'}
+        ).eval(eval_dataset, dataset_sink_mode=False)
+        print("epoch: {}, avg loss: {}, valid: {}".format(epoch + 1, epoch_loss, acc))
+        if acc['acc'] > best_acc:
+            best_acc = acc['acc']
+            save_checkpoint(
+                network,
+                os.path.join(config.save_ckpt_path, f"mobilenetv2-best.ckpt"),
+            )
 
     return history
 
-if os.path.exists(config.save_ckpt_path):
-    shutil.rmtree(config.save_ckpt_path)
-os.makedirs(config.save_ckpt_path)
 
+if not os.path.exists(config.save_ckpt_path):
+    os.makedirs(config.save_ckpt_path)
 history = train_head()
-
-CKPT = f'mobilenetv2-{config.epochs}.ckpt'
-print("Chosen checkpoint is", CKPT)
 print('training is ok!!!')
