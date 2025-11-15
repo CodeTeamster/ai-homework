@@ -1,10 +1,7 @@
-from utils import DGraphFin, MLP
-from utils.evaluator import Evaluator
-from torch_geometric.nn.models import GraphSAGE
+from utils import DGraphFin, GraphSAGE
 
-import os
+
 import torch
-import torch.nn.functional as F
 import torch_geometric.transforms as T
 
 
@@ -13,7 +10,6 @@ device = 0
 device = f'cuda:{device}' if torch.cuda.is_available() else 'cpu'
 device = torch.device(device)
 path='./datasets/632d74d4e2843a53167ee9a1-momodel/'
-
 
 # 2.Datasets
 dataset_name='DGraph'
@@ -34,32 +30,23 @@ if data.y.dim() == 2:
     data.y = data.y.squeeze(1)
 split_idx = {'train': data.train_mask, 'valid': data.valid_mask, 'test': data.test_mask}
 
-
 # 3.Initialize model
 model_para = {
     'in_channels': data.x.size(-1),
-    'hidden_channels': 128,
-    'num_layers': 3,
+    'hidden_channels': 64,
+    'num_layers': 2,
     'out_channels': nlabels,
     # 'heads': 8,
     'dropout': 0.5,
-    # 'v2': False,
-    # 'batchnorm': False,
+    'batchnorm': False,
 }
-model_path = f'./results/GraphSAGE-layer{model_para["num_layers"]}-hid{model_para["hidden_channels"]}-drop{model_para["dropout"]}-ce.pt'
-out_path = f'./results/GraphSAGE-layer{model_para["num_layers"]}-hid{model_para["hidden_channels"]}-drop{model_para["dropout"]}-ce-out.csv'
-# model = MLP(**model_para).to(device)
+model_path = f'./results/GraphSAGE-layer{model_para["num_layers"]}-hid{model_para["hidden_channels"]}-drop{model_para["dropout"]}.pt'
+out_path = f'./results/GraphSAGE-layer{model_para["num_layers"]}-hid{model_para["hidden_channels"]}-drop{model_para["dropout"]}-out.pt'
 model = GraphSAGE(**model_para).to(device)
 model.load_state_dict(
     torch.load(model_path, map_location=device)
 )
-out = F.log_softmax(
-    model(
-        x=data.x,
-        edge_index=data.adj_t,
-    ),
-    dim=-1,
-)
+out = model(data.x, data.adj_t)
 torch.save(out, out_path)
 
 
@@ -76,16 +63,3 @@ def predict(data, node_id):
     y_pred = out.exp()[node_id]  # (N,num_classes)
 
     return y_pred
-
-
-node_idx = data.valid_mask
-y_pred = torch.argmax(predict(data, node_idx), dim=-1)
-y_pred = y_pred.unsqueeze(0) if y_pred.dim() == 1 else y_pred
-y_true = torch.tensor([data.y[node_idx]], device=device) if data.y[node_idx].numel() == 1 else data.y[node_idx]
-# print(
-#     evaluator.eval(
-#         y_true,
-#         y_pred,
-#     )[evaluator.eval_metric]
-# )
-print((y_pred == y_true).sum() / y_true.shape[0])
